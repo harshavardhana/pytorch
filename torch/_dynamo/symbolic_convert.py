@@ -53,7 +53,11 @@ from typing_extensions import TypeIs
 import torch
 import torch._logging
 from torch._dynamo.dynamo_profiler import DynamoProfilerState, FunctionTraceTiming
-from torch._dynamo.exc import ObservedException, TensorifyScalarRestartAnalysis
+from torch._dynamo.exc import (
+    FakeTensorObservedException,
+    ObservedException,
+    TensorifyScalarRestartAnalysis,
+)
 from torch._guards import InlinedCodeCache, tracing, TracingContext
 from torch._logging.structured import dump_file
 from torch.fx.experimental.symbolic_shapes import guard_bool
@@ -1604,6 +1608,16 @@ class InstructionTranslatorBase(
             return not self.output.should_exit
         except TensorifyScalarRestartAnalysis:
             raise
+        except FakeTensorObservedException as e:
+            try:
+                self.exception_handler(e)
+            except Unsupported as use:
+                raise exc.TorchRuntimeError(
+                    str(use), getattr(use, "real_stack", None)
+                ).with_traceback(use.__traceback__) from None
+            if e.node is not None:
+                self.output.graph.erase_node(e.node)
+            return True
         except exc.ObservedException as e:
             self.exception_handler(e)
             return True
@@ -2727,7 +2741,9 @@ class InstructionTranslatorBase(
             # Bubble the exception to the interpreter
             curr_exc = self.exn_vt_stack.get_current_exception()
             dynamo_exc = exc.get_dynamo_observed_exception(curr_exc.python_type())
-            if not isinstance(raised_exception, dynamo_exc):
+            if not isinstance(
+                raised_exception, (dynamo_exc, FakeTensorObservedException)
+            ):
                 raise AssertionError(
                     "expected isinstance(raised_exception, dynamo_exc) to be true"
                 )  # sanity check
