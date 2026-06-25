@@ -51,7 +51,8 @@ def test_basic_matrix():
     check(result.returncode == 0, result.stderr)
     output = parse_output(result.stdout)
     runners = [e["runner"] for e in output["include"]]
-    check(runners == ["l-x86iavx512-16-128", "l-x86iavx512-8-64"])
+    # Empty prefix (no-runner-experiments) -> mt-; a bare l-* would queue.
+    check(runners == ["mt-l-x86iavx512-16-128", "mt-l-x86iavx512-8-64"])
 
 
 def test_matrix_with_prefix():
@@ -81,7 +82,7 @@ def test_matrix_without_prefix_when_none_present():
     result = run(matrix)
     check(result.returncode == 0, result.stderr)
     output = parse_output(result.stdout)
-    check(output["include"][0]["runner"] == "l-x86aavx2-29-113-a10g")
+    check(output["include"][0]["runner"] == "mt-l-x86aavx2-29-113-a10g")
 
 
 def test_unknown_runner_fails():
@@ -114,7 +115,7 @@ def test_preserves_non_runner_fields():
     check(entry["config"] == "default")
     check(entry["shard"] == 3)
     check(entry["num_shards"] == 7)
-    check(entry["runner"] == "l-x86iavx512-2-4")
+    check(entry["runner"] == "mt-l-x86iavx512-2-4")
 
 
 def test_empty_include_passes_through():
@@ -143,9 +144,9 @@ def test_mixed_runners():
     check(
         runners
         == [
-            "l-x86iavx512-16-128",
-            "l-x86aavx2-29-113-a10g",
-            "l-arm64g2-6-32",
+            "mt-l-x86iavx512-16-128",
+            "mt-l-x86aavx2-29-113-a10g",
+            "mt-l-arm64g2-6-32",
         ]
     )
 
@@ -183,7 +184,7 @@ def test_github_output_file():
             contents.startswith("test-matrix="), f"unexpected file contents: {contents}"
         )
         written = json.loads(contents[len("test-matrix=") :].strip())
-        check(written["include"][0]["runner"] == "l-x86iavx512-8-64")
+        check(written["include"][0]["runner"] == "mt-l-x86iavx512-8-64")
     finally:
         os.unlink(tmp_path)
 
@@ -258,6 +259,36 @@ def test_h100_multi_gpu_variants_force_mt():
             "mt-l-bx86iamx-176-1800-h100-8",
         ],
         f"unexpected runners: {runners}",
+    )
+
+
+def test_empty_prefix_defaults_osdc_runner_to_mt():
+    """ci-infra#841: empty prefix must still yield mt- for OSDC runners."""
+    matrix = """{ include: [
+      { config: "docs_test", shard: 1, num_shards: 1, runner: "linux.2xlarge" },
+      { config: "default", shard: 1, num_shards: 1, runner: "linux.arm64.m8g.4xlarge" },
+    ]}"""
+    result = run(matrix)
+    check(result.returncode == 0, result.stderr)
+    runners = [e["runner"] for e in parse_output(result.stdout)["include"]]
+    check(
+        runners == ["mt-l-x86iavx512-8-64", "mt-l-arm64g4-16-62"],
+        f"empty prefix must default OSDC runners to mt-, got {runners}",
+    )
+
+
+def test_empty_prefix_passthrough_stays_bare():
+    """Passthrough runners stay bare even with empty prefix (no OSDC equivalent)."""
+    matrix = """{ include: [
+      { config: "default", shard: 1, num_shards: 1, runner: "linux.rocm.gpu.2" },
+      { config: "default", shard: 1, num_shards: 1, runner: "linux.idc.xpu" },
+    ]}"""
+    result = run(matrix)
+    check(result.returncode == 0, result.stderr)
+    runners = [e["runner"] for e in parse_output(result.stdout)["include"]]
+    check(
+        runners == ["linux.rocm.gpu.2", "linux.idc.xpu"],
+        f"passthrough runners must stay bare even with empty prefix, got {runners}",
     )
 
 

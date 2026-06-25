@@ -106,7 +106,12 @@ def main() -> None:
             continue
         # Passthrough runners (e.g. linux.rocm.gpu.2, linux.idc.xpu) are not
         # OSDC-managed so they keep their original label without the prefix.
-        entry["runner"] = mapped if mapped == clean else args.prefix + mapped
+        if mapped == clean:
+            entry["runner"] = mapped
+            continue
+        # OSDC-managed ARC runner: prefix is mandatory (a bare l-* has no Meta
+        # equivalent and queues). Empty prefix (no-runner-experiments) -> mt-.
+        entry["runner"] = (args.prefix or "mt-") + mapped
 
     set_output("test-matrix", json.dumps(matrix))
 
