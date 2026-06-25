@@ -16,3 +16,13 @@ struct CatInputParams {
   ::c10::metal::array<idx_type_t, N> input_strides;
   ::c10::metal::array<idx_type_t, N> input_sizes;
 };
+
+// Byte geometry for one dispatch of the contiguous `cat` fast path.
+template <typename idx_type_t = uint32_t>
+struct CatCopyParams {
+  idx_type_t chunk_base;
+  idx_type_t slice_bytes;
+  idx_type_t out_stride_bytes;
+  idx_type_t cat_off_bytes;
+  uint32_t nbytes;
+};

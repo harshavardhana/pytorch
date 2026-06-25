@@ -6,6 +6,81 @@
 using namespace metal;
 using namespace c10::metal;
 
+// Each thread copies a 16-byte chunk of an input into the output, using the
+// widest aligned vector store its address allows, and a per-byte copy for runs
+// that cross a slice boundary. See cat_out_mps_contiguous_impl for the
+// geometry.
+template <typename I>
+kernel void cat_copy_contiguous(
+    constant uchar* input [[buffer(0)]],
+    device uchar* output [[buffer(1)]],
+    constant CatCopyParams<I>& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+  uint pos = tid * 16;
+  if (pos >= params.nbytes) {
+    return;
+  }
+  I g = params.chunk_base + pos;
+  I o = g / params.slice_bytes;
+  I j = g - o * params.slice_bytes;
+  constant uchar* inp = input + g;
+
+  // A run that crosses a slice boundary (or the dispatch tail) maps to
+  // discontiguous output, so copy it byte by byte, recomputing the destination.
+  if (params.slice_bytes - j < 16 || pos + 16 > params.nbytes) {
+    uint stop = min(pos + 16u, params.nbytes) - pos;
+    for (uint i = 0; i < stop; i++) {
+      I gg = g + i;
+      I oo = gg / params.slice_bytes;
+      I jj = gg - oo * params.slice_bytes;
+      output[oo * params.out_stride_bytes + params.cat_off_bytes + jj] = inp[i];
+    }
+    return;
+  }
+
+  // Whole 16-byte run: copy with the widest store both endpoints are aligned
+  // for.
+  device uchar* out =
+      output + o * params.out_stride_bytes + params.cat_off_bytes + j;
+  uint align = (reinterpret_cast<device ulong>(out) |
+                reinterpret_cast<constant ulong>(inp)) &
+      15;
+  if (align == 0) {
+    *reinterpret_cast<device uint4*>(out) =
+        *reinterpret_cast<constant uint4*>(inp);
+  } else if ((align & 7) == 0) {
+    for (uint k = 0; k < 2; k++) {
+      reinterpret_cast<device uint2*>(out)[k] =
+          reinterpret_cast<constant uint2*>(inp)[k];
+    }
+  } else if ((align & 3) == 0) {
+    for (uint k = 0; k < 4; k++) {
+      reinterpret_cast<device uint*>(out)[k] =
+          reinterpret_cast<constant uint*>(inp)[k];
+    }
+  } else if ((align & 1) == 0) {
+    for (uint k = 0; k < 8; k++) {
+      reinterpret_cast<device ushort*>(out)[k] =
+          reinterpret_cast<constant ushort*>(inp)[k];
+    }
+  } else {
+    for (uint k = 0; k < 16; k++) {
+      out[k] = inp[k];
+    }
+  }
+}
+
+#define REGISTER_CAT_COPY_OP(I, SUFFIX)                  \
+  template [[host_name("cat_copy_contiguous_" #SUFFIX)]] \
+  kernel void cat_copy_contiguous<I>(                    \
+      constant uchar * input [[buffer(0)]],              \
+      device uchar * output [[buffer(1)]],               \
+      constant CatCopyParams<I> & params [[buffer(2)]],  \
+      uint tid [[thread_position_in_grid]]);
+
+REGISTER_CAT_COPY_OP(uint, u32);
+REGISTER_CAT_COPY_OP(ulong, u64);
+
 template <typename I, typename T_in, typename T_out>
 kernel void cat(
     constant T_in* input [[buffer(0)]],

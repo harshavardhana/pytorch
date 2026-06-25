@@ -65,28 +65,70 @@ std::string get_type_str<int32_t>() {
   return "int32_t";
 }
 
-// If all tensors are contiguous with the same dtype and the cat dimension is 0,
-// then we can simply copy each tensor's underlying buffer contiguously into the
-// output.
-static void cat_out_mps_contiguous_impl(const ITensorListRef& inputs, const Tensor& output) {
+// Contiguous, same-dtype cat along any dim: a batched contiguous copy of each
+// input's byte slices into strided output locations. Uses a compute copy, not an
+// MTLBlit addressing issue #188198. I is the byte-index type: uint32_t unless
+// an extent can exceed 4GB.
+template <typename I>
+static void cat_out_mps_contiguous_impl(const ITensorListRef& inputs, int64_t dimension, const Tensor& output) {
   MPSStream* stream = getCurrentMPSStream();
   id<MTLBuffer> output_buffer = getMTLBufferStorage(output);
-  size_t output_offset = output.storage_offset() * output.itemsize();
 
+  uint64_t inner_bytes = output.itemsize();
+  for (const auto d : c10::irange(dimension + 1, output.dim())) {
+    inner_bytes *= output.size(d);
+  }
+  uint64_t out_stride_bytes = output.size(dimension) * inner_bytes;
+
+  const std::string kernel_name = fmt::format("cat_copy_contiguous{}", mtlIdxSuffix(std::is_same_v<I, uint32_t>));
+
+  // 2GB cap so pos = tid * 16 stays within the kernel's 32-bit thread index.
+  constexpr uint64_t max_chunk_bytes = 0x80000000ull;
+
+  int64_t cat_dim_offset = 0;
   for (const Tensor& input : inputs) {
     if (cat_should_skip_tensor(input)) {
       continue;
     }
 
     id<MTLBuffer> input_buffer = getMTLBufferStorage(input);
-    size_t input_offset = input.storage_offset() * input.itemsize();
-    auto nbytes = input.nbytes();
-    auto profile_id =
-        getMPSProfiler().beginProfileCopy(input_buffer, output_buffer, input, output, nbytes, /*non_blocking=*/true);
+    uint64_t nbytes = input.nbytes();
+    CatCopyParams<I> params;
+    params.slice_bytes = static_cast<I>(input.size(dimension) * inner_bytes);
+    params.out_stride_bytes = static_cast<I>(out_stride_bytes);
+    params.cat_off_bytes = static_cast<I>(cat_dim_offset * inner_bytes);
 
-    stream->copy(input_buffer, output_buffer, nbytes, input_offset, output_offset, profile_id, SyncType::NONE);
+    for (uint64_t bytes_copied = 0; bytes_copied < nbytes;) {
+      uint32_t chunk_bytes = static_cast<uint32_t>(std::min(max_chunk_bytes, nbytes - bytes_copied));
+      params.chunk_base = static_cast<I>(bytes_copied);
+      params.nbytes = chunk_bytes;
+      uint64_t num_threads = (chunk_bytes + 15) / 16;
 
-    output_offset += nbytes;
+      auto profile_id = getMPSProfiler().beginProfileCopy(input_buffer,
+                                                          output_buffer,
+                                                          input,
+                                                          output,
+                                                          chunk_bytes,
+                                                          /*non_blocking=*/true,
+                                                          /*usesBlitter=*/false);
+
+      dispatch_sync_with_rethrow(stream->queue(), ^() {
+        @autoreleasepool {
+          id<MTLComputeCommandEncoder> computeEncoder = stream->commandEncoder();
+          auto pipeline_state = lib.getPipelineStateForFunc(kernel_name);
+          [computeEncoder setComputePipelineState:pipeline_state];
+          mtl_setArgs(computeEncoder, input, output, params);
+          mtl_dispatch1DJob(computeEncoder, pipeline_state, num_threads);
+        }
+      });
+      if (profile_id) {
+        getMPSProfiler().endProfileCopy(profile_id, SyncType::NONE);
+      }
+
+      bytes_copied += chunk_bytes;
+    }
+
+    cat_dim_offset += input.size(dimension);
   }
 }
 
@@ -176,8 +218,12 @@ TORCH_IMPL_FUNC(cat_out_mps)
         return !cat_should_skip_tensor(t) && isTooLargeForMPSGraph(t);
       });
 
-  if (all_contiguous && all_same_dtype && (memory_format == MemoryFormat::Contiguous) && (dimension == 0)) {
-    return mps::cat_out_mps_contiguous_impl(materialized_inputs, out);
+  if (all_contiguous && all_same_dtype && (memory_format == MemoryFormat::Contiguous)) {
+    // out.nbytes() bounds every index extent, since inputs are sub-slabs of out.
+    if (static_cast<uint64_t>(out.nbytes()) > std::numeric_limits<uint32_t>::max()) {
+      return mps::cat_out_mps_contiguous_impl<uint64_t>(materialized_inputs, dimension, out);
+    }
+    return mps::cat_out_mps_contiguous_impl<uint32_t>(materialized_inputs, dimension, out);
   } else if (has_large_tensor) {
     return mps::cat_out_mps_impl<int64_t>(materialized_inputs, dimension, out);
   } else {
