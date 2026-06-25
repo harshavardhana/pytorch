@@ -291,7 +291,7 @@ def constructors(
     with in_kernel_invocation_manager(fake_mode):
         r = func(*args, **new_kwargs)
     if isinstance(fake_mode, CppFakeTensorMode):
-        return r
+        return fake_mode.from_meta_and_device(r, out_device)
     return FakeTensor(fake_mode, r, out_device)
 
 
